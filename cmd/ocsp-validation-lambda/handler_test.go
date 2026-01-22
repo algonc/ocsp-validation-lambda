@@ -96,3 +96,30 @@ func TestHandler_Success(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotEmpty(t, resp.OCSPResponseBase64)
 }
+
+
+func TestHandler_ExpiredOCSP(t *testing.T) {
+	leaf, _, issuer, issuerKey := generateTestCerts(t)
+
+	ocspResp := buildOCSPResponse(t, leaf, issuer, issuerKey, ocsp.Good, time.Now().Add(-1*time.Hour))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(ocspResp)
+	}))
+	defer server.Close()
+
+	leaf.OCSPServer = []string{server.URL}
+
+	req := Request{
+		CertChain: []string{
+			base64.StdEncoding.EncodeToString(leaf.Raw),
+			base64.StdEncoding.EncodeToString(issuer.Raw),
+		},
+	}
+
+	_, err := handler(context.Background(), req)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "expired")
+}
