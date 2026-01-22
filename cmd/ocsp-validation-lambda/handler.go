@@ -7,14 +7,16 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/sha1"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
@@ -22,138 +24,178 @@ import (
 )
 
 type Request struct {
-	CertChain []string `json:"certChain"` // Base64 DER certs, leaf first
+	CertChain []string `json:"certChain"`
 }
 
 type Response struct {
 	OCSPResponseBase64 string `json:"ocspResponseBase64"`
 }
 
+const (
+	maxRetries        = 3
+	baseBackoff       = 500 * time.Millisecond
+	httpTimeout       = 8 * time.Second
+	metricsNamespace  = "OCSPService"
+)
+
 func handler(ctx context.Context, req Request) (Response, error) {
+	start := time.Now()
+
 	if len(req.CertChain) < 2 {
-		return Response{}, errors.New("certificate chain must include at least leaf and issuer")
+		recordMetric("InvalidInput", 1)
+		return Response{}, errors.New("certificate chain must contain at least leaf and issuer")
 	}
 
-	// -------------------------
-	// Parse Certificates
-	// -------------------------
-	certs := make([]*x509.Certificate, len(req.CertChain))
-
-	for i, certB64 := range req.CertChain {
-		derBytes, err := base64.StdEncoding.DecodeString(certB64)
-		if err != nil {
-			return Response{}, fmt.Errorf("failed to decode cert %d: %w", i, err)
-		}
-
-		cert, err := x509.ParseCertificate(derBytes)
-		if err != nil {
-			return Response{}, fmt.Errorf("failed to parse cert %d: %w", i, err)
-		}
-
-		certs[i] = cert
+	// ---------------- Parse Certificates ----------------
+	certs, err := parseCertificates(req.CertChain)
+	if err != nil {
+		recordMetric("ParseError", 1)
+		return Response{}, err
 	}
 
 	leaf := certs[0]
-	issuer := certs[1] // OCSP must use direct issuer
+	issuer := certs[1]
 
-	// -------------------------
-	// Locate OCSP Endpoint
-	// -------------------------
-	ocspURL := ""
-
-	if len(leaf.OCSPServer) > 0 {
-		ocspURL = leaf.OCSPServer[0]
-	} else {
-		for i := 1; i < len(certs); i++ {
-			if len(certs[i].OCSPServer) > 0 {
-				ocspURL = certs[i].OCSPServer[0]
-				break
-			}
-		}
-	}
-
+	// ---------------- Locate OCSP Endpoint ----------------
+	ocspURL := findOCSPEndpoint(certs)
 	if ocspURL == "" {
-		return Response{}, errors.New("no OCSP endpoint found in certificate chain")
+		recordMetric("NoEndpoint", 1)
+		return Response{}, errors.New("no OCSP endpoint found")
 	}
 
-	log.Printf("Using OCSP endpoint: %s", ocspURL)
+	logJSON("OCSP endpoint selected", map[string]any{
+		"url": ocspURL,
+	})
 
-	// -------------------------
-	// Build OCSP Request
-	// -------------------------
-	ocspReqBytes, err := ocsp.CreateRequest(
-		leaf,
-		issuer,
-		&ocsp.RequestOptions{
-			Hash: crypto.SHA1, // SHA1 is required by many OCSP responders
-		},
-	)
+	// ---------------- Build OCSP Request ----------------
+	ocspReq, err := ocsp.CreateRequest(leaf, issuer, &ocsp.RequestOptions{
+		Hash: crypto.SHA1,
+	})
 	if err != nil {
-		return Response{}, fmt.Errorf("failed to create OCSP request: %w", err)
+		recordMetric("RequestBuildError", 1)
+		return Response{}, fmt.Errorf("failed to build OCSP request: %w", err)
 	}
 
-	log.Printf("OCSP request created (len=%d)", len(ocspReqBytes))
-
-	// -------------------------
-	// Execute HTTP Request
-	// -------------------------
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ocspURL, bytes.NewReader(ocspReqBytes))
+	// ---------------- Execute with Retry ----------------
+	respBytes, err := executeWithRetry(ctx, ocspURL, ocspReq)
 	if err != nil {
-		return Response{}, fmt.Errorf("failed to create HTTP request: %w", err)
+		recordMetric("RequestFailure", 1)
+		return Response{}, err
 	}
 
-	httpReq.Header.Set("Content-Type", "application/ocsp-request")
-	httpReq.Header.Set("Accept", "application/ocsp-response")
-
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		return Response{}, fmt.Errorf("failed to execute OCSP HTTP request: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	if httpResp.StatusCode != http.StatusOK {
-		return Response{}, fmt.Errorf("OCSP responder returned status %d", httpResp.StatusCode)
-	}
-
-	respBytes, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		return Response{}, fmt.Errorf("failed to read OCSP response: %w", err)
-	}
-
-	log.Printf("OCSP response received (len=%d)", len(respBytes))
-
-	// -------------------------
-	// Parse + Inspect OCSP Response
-	// -------------------------
+	// ---------------- Parse + Validate Response ----------------
 	ocspResp, err := ocsp.ParseResponse(respBytes, issuer)
 	if err != nil {
-		return Response{}, fmt.Errorf("failed to parse OCSP response: %w", err)
+		recordMetric("ParseResponseError", 1)
+		return Response{}, fmt.Errorf("invalid OCSP response: %w", err)
 	}
 
-	log.Printf("OCSP Response Status: %s", ocspStatusToString(ocspResp.Status))
-	log.Printf("This Update: %s", ocspResp.ThisUpdate)
-	log.Printf("Next Update: %s", ocspResp.NextUpdate)
-	log.Printf("Produced At: %s", ocspResp.ProducedAt)
-
-	if ocspResp.SerialNumber.Cmp(leaf.SerialNumber) != 0 {
-		return Response{}, errors.New("OCSP response serial number mismatch")
+	if err := validateOCSPResponse(ocspResp, leaf); err != nil {
+		recordMetric("ValidationError", 1)
+		return Response{}, err
 	}
 
-	// -------------------------
-	// Return Base64 OCSP Response (for stapling)
-	// -------------------------
-	ocspRespBase64 := base64.StdEncoding.EncodeToString(respBytes)
+	logJSON("OCSP validated", map[string]any{
+		"status":      statusToString(ocspResp.Status),
+		"thisUpdate":  ocspResp.ThisUpdate,
+		"nextUpdate":  ocspResp.NextUpdate,
+		"producedAt":  ocspResp.ProducedAt,
+	})
+
+	recordMetric("Success", 1)
+	recordMetric("LatencyMs", float64(time.Since(start).Milliseconds()))
 
 	return Response{
-		OCSPResponseBase64: ocspRespBase64,
+		OCSPResponseBase64: base64.StdEncoding.EncodeToString(respBytes),
 	}, nil
 }
 
-func ocspStatusToString(status int) string {
+func parseCertificates(chain []string) ([]*x509.Certificate, error) {
+	certs := make([]*x509.Certificate, len(chain))
+	for i, b64 := range chain {
+		der, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return nil, fmt.Errorf("decode error cert %d: %w", i, err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return nil, fmt.Errorf("parse error cert %d: %w", i, err)
+		}
+		certs[i] = cert
+	}
+	return certs, nil
+}
+
+func findOCSPEndpoint(certs []*x509.Certificate) string {
+	if len(certs[0].OCSPServer) > 0 {
+		return certs[0].OCSPServer[0]
+	}
+	for i := 1; i < len(certs); i++ {
+		if len(certs[i].OCSPServer) > 0 {
+			return certs[i].OCSPServer[0]
+		}
+	}
+	return ""
+}
+
+func executeWithRetry(ctx context.Context, url string, body []byte) ([]byte, error) {
+	client := &http.Client{Timeout: httpTimeout}
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/ocsp-request")
+		req.Header.Set("Accept", "application/ocsp-response")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+		} else {
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				return io.ReadAll(resp.Body)
+			}
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+
+		backoff := baseBackoff * time.Duration(1<<attempt)
+		jitter := time.Duration(rand.Int63n(int64(200 * time.Millisecond)))
+		sleep := backoff + jitter
+
+		logJSON("OCSP retry", map[string]any{
+			"attempt": attempt + 1,
+			"error":   lastErr.Error(),
+			"sleepMs": sleep.Milliseconds(),
+		})
+
+		select {
+		case <-time.After(sleep):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	return nil, fmt.Errorf("OCSP request failed after retries: %w", lastErr)
+}
+
+func validateOCSPResponse(resp *ocsp.Response, leaf *x509.Certificate) error {
+	if resp.SerialNumber.Cmp(leaf.SerialNumber) != 0 {
+		return errors.New("OCSP serial mismatch")
+	}
+
+	if time.Now().After(resp.NextUpdate) {
+		return errors.New("OCSP response expired")
+	}
+
+	if resp.Status != ocsp.Good {
+		return fmt.Errorf("certificate status is %s", statusToString(resp.Status))
+	}
+
+	return nil
+}
+
+func statusToString(status int) string {
 	switch status {
 	case ocsp.Good:
 		return "GOOD"
@@ -162,8 +204,43 @@ func ocspStatusToString(status int) string {
 	case ocsp.Unknown:
 		return "UNKNOWN"
 	default:
-		return fmt.Sprintf("UNDEFINED (%d)", status)
+		return "UNDEFINED"
 	}
+}
+
+func logJSON(msg string, fields map[string]any) {
+	entry := map[string]any{
+		"message": msg,
+		"service": "ocsp-lambda",
+	}
+	for k, v := range fields {
+		entry[k] = v
+	}
+	j, _ := json.Marshal(entry)
+	log.Println(string(j))
+}
+
+func recordMetric(name string, value float64) {
+	emf := map[string]any{
+		"_aws": map[string]any{
+			"Timestamp": time.Now().UnixMilli(),
+			"CloudWatchMetrics": []map[string]any{
+				{
+					"Namespace": metricsNamespace,
+					"Dimensions": [][]string{
+						{"Service"},
+					},
+					"Metrics": []map[string]string{
+						{"Name": name},
+					},
+				},
+			},
+		},
+		"Service": name,
+		name:      value,
+	}
+	b, _ := json.Marshal(emf)
+	fmt.Fprintln(os.Stdout, string(b))
 }
 
 func main() {
