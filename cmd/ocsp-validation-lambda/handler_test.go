@@ -150,3 +150,25 @@ func TestHandler_SerialMismatch(t *testing.T) {
 	_, err := handler(context.Background(), req)
 	assert.Error(t, err)
 }
+
+func TestHandler_RetryFailure(t *testing.T) {
+	leaf, _, issuer, _ := generateTestCerts(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	leaf.OCSPServer = []string{server.URL}
+
+	req := Request{
+		CertChain: []string{
+			base64.StdEncoding.EncodeToString(leaf.Raw),
+			base64.StdEncoding.EncodeToString(issuer.Raw),
+		},
+	}
+
+	_, err := handler(context.Background(), req)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed after retries")
+}
