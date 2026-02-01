@@ -172,3 +172,28 @@ func TestHandler_RetryFailure(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed after retries")
 }
+
+func TestHandler_NoOCSPEndpoint(t *testing.T) {
+	leaf, _, issuer, _ := generateTestCerts(t)
+	leaf.OCSPServer = nil
+
+	req := Request{
+		CertChain: []string{
+			base64.StdEncoding.EncodeToString(leaf.Raw),
+			base64.StdEncoding.EncodeToString(issuer.Raw),
+		},
+	}
+
+	_, err := handler(context.Background(), req)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no OCSP endpoint")
+}
+
+func TestHandler_InvalidCertInput(t *testing.T) {
+	req := Request{
+		CertChain: []string{"invalid-base64"},
+	}
+
+	_, err := handler(context.Background(), req)
+	assert.Error(t, err)
+}
