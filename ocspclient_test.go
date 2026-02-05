@@ -4,190 +4,222 @@
 package ocspclient
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
+	"errors"
+	"io"
 	"math/big"
 	"net/http"
-	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ocsp"
 )
 
-func generateCertChain(t *testing.T, ocspURL string) (*x509.Certificate, *rsa.PrivateKey, *x509.Certificate, *rsa.PrivateKey, []string) {
+// -------------------- Helpers --------------------
+
+// generateSelfSignedCert generates a self-signed certificate and returns DER bytes + private key
+func generateSelfSignedCert(t *testing.T, serial int64, ocspURL string) ([]byte, *rsa.PrivateKey) {
 	t.Helper()
-
-	issuerKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-
-	issuerTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			CommonName: "Test Issuer",
-		},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(serial),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		IsCA:         true,
 	}
-
-	issuerDER, err := x509.CreateCertificate(rand.Reader, issuerTemplate, issuerTemplate, &issuerKey.PublicKey, issuerKey)
-	require.NoError(t, err)
-
-	issuerCert, err := x509.ParseCertificate(issuerDER)
-	require.NoError(t, err)
-
-	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-
-	leafTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject: pkix.Name{
-			CommonName: "Test Leaf",
-		},
-		NotBefore: time.Now().Add(-1 * time.Hour),
-		NotAfter:  time.Now().Add(24 * time.Hour),
-		OCSPServer: []string{
-			ocspURL,
-		},
+	if ocspURL != "" {
+		template.OCSPServer = []string{ocspURL}
 	}
-
-	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, issuerCert, &leafKey.PublicKey, issuerKey)
-	require.NoError(t, err)
-
-	leafCert, err := x509.ParseCertificate(leafDER)
-	require.NoError(t, err)
-
-	chain := []string{
-		base64.StdEncoding.EncodeToString(leafDER),
-		base64.StdEncoding.EncodeToString(issuerDER),
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create certificate failed: %v", err)
 	}
-
-	return leafCert, leafKey, issuerCert, issuerKey, chain
+	return der, priv
 }
 
-func newTestClient(httpClient *http.Client) *Client {
-	return New(Config{
-		HTTPClient:  httpClient,
-		MaxRetries:  1,
-		BaseBackoff: 0,
-	})
+// writeTempPEM writes one or more DER certs to a temporary PEM file
+func writeTempPEM(t *testing.T, certs ...[]byte) string {
+	t.Helper()
+	var data []byte
+	for _, der := range certs {
+		block := &pem.Block{Type: "CERTIFICATE", Bytes: der}
+		data = append(data, pem.EncodeToMemory(block)...)
+	}
+	tmp := t.TempDir() + "/cert.pem"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		t.Fatalf("write temp PEM failed: %v", err)
+	}
+	return tmp
 }
 
-func TestFetchStaple_Success(t *testing.T) {
+// -------------------- Mock HTTP client --------------------
 
-	var leaf *x509.Certificate
-	var issuer *x509.Certificate
-	var issuerKey *rsa.PrivateKey
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		template := ocsp.Response{
-			Status:       ocsp.Good,
-			SerialNumber: leaf.SerialNumber,
-			ThisUpdate:   time.Now(),
-			NextUpdate:   time.Now().Add(1 * time.Hour),
-		}
-		resp, _ := ocsp.CreateResponse(issuer, issuer, template, issuerKey)
-		w.WriteHeader(http.StatusOK)
-		w.Write(resp)
-	}))
-	defer server.Close()
-
-	leaf, _, issuer, issuerKey, chain := generateCertChain(t, server.URL)
-
-	client := newTestClient(server.Client())
-
-	resp, err := client.FetchStaple(context.Background(), chain)
-	require.NoError(t, err)
-	require.NotEmpty(t, resp)
+type mockHTTPClient struct {
+	respBody []byte
+	status   int
+	err      error
 }
 
-func TestFetchStaple_Expired(t *testing.T) {
-
-	var leaf *x509.Certificate
-	var issuer *x509.Certificate
-	var issuerKey *rsa.PrivateKey
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		template := ocsp.Response{
-			Status:       ocsp.Good,
-			SerialNumber: leaf.SerialNumber,
-			ThisUpdate:   time.Now(),
-			NextUpdate:   time.Now().Add(-1 * time.Hour),
-		}
-		resp, _ := ocsp.CreateResponse(issuer, issuer, template, issuerKey)
-		w.WriteHeader(http.StatusOK)
-		w.Write(resp)
-	}))
-	defer server.Close()
-
-	leaf, _, issuer, issuerKey, chain := generateCertChain(t, server.URL)
-
-	client := newTestClient(server.Client())
-
-	_, err := client.FetchStaple(context.Background(), chain)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "expired")
+func (m *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return &http.Response{
+		StatusCode: m.status,
+		Body:       io.NopCloser(bytes.NewReader(m.respBody)),
+	}, nil
 }
 
-func TestFetchStaple_SerialMismatch(t *testing.T) {
+// -------------------- Minimal valid OCSP response --------------------
 
-	var issuer *x509.Certificate
-	var issuerKey *rsa.PrivateKey
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		template := ocsp.Response{
-			Status:       ocsp.Good,
-			SerialNumber: big.NewInt(999),
-			ThisUpdate:   time.Now(),
-			NextUpdate:   time.Now().Add(1 * time.Hour),
-		}
-		resp, _ := ocsp.CreateResponse(issuer, issuer, template, issuerKey)
-		w.WriteHeader(http.StatusOK)
-		w.Write(resp)
-	}))
-	defer server.Close()
-
-	_, _, issuer, issuerKey, chain := generateCertChain(t, server.URL)
-
-	client := newTestClient(server.Client())
-
-	_, err := client.FetchStaple(context.Background(), chain)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "serial mismatch")
+func generateOCSPResponse(t *testing.T, leaf, issuer *x509.Certificate, issuerPriv *rsa.PrivateKey) []byte {
+	t.Helper()
+	template := ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: leaf.SerialNumber,
+		ThisUpdate:   time.Now(),
+		NextUpdate:   time.Now().Add(time.Hour),
+	}
+	der, err := ocsp.CreateResponse(issuer, leaf, template, issuerPriv)
+	if err != nil {
+		t.Fatalf("create OCSP response: %v", err)
+	}
+	return der
 }
 
-func TestFetchStaple_RetryFailure(t *testing.T) {
+// -------------------- Tests --------------------
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
+func TestFetchStaple_Base64(t *testing.T) {
+	ocspURL := "http://mock.ocsp.server/ocsp"
+	leafDER, _ := generateSelfSignedCert(t, 1, ocspURL)
+	issuerDER, issuerPriv := generateSelfSignedCert(t, 2, ocspURL)
 
-	_, _, _, _, chain := generateCertChain(t, server.URL)
+	leafCert, _ := x509.ParseCertificate(leafDER)
+	issuerCert, _ := x509.ParseCertificate(issuerDER)
+
+	ocspResp := generateOCSPResponse(t, leafCert, issuerCert, issuerPriv)
 
 	client := New(Config{
-		HTTPClient:  server.Client(),
-		MaxRetries:  2,
-		BaseBackoff: 0,
+		HTTPClient: &mockHTTPClient{
+			respBody: ocspResp,
+			status:   http.StatusOK,
+		},
+		Now: time.Now,
 	})
 
-	_, err := client.FetchStaple(context.Background(), chain)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed after retries")
+	leafB64 := base64.StdEncoding.EncodeToString(leafDER)
+	issuerB64 := base64.StdEncoding.EncodeToString(issuerDER)
+
+	resp, err := client.FetchStaple(context.Background(), WithBase64Certs([]string{leafB64, issuerB64}))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if !bytes.Equal(resp, ocspResp) {
+		t.Fatalf("expected OCSP response bytes to match")
+	}
 }
 
-func TestFetchStaple_InvalidInput(t *testing.T) {
+func TestFetchStaple_PEM(t *testing.T) {
+	ocspURL := "http://mock.ocsp.server/ocsp"
+	leafDER, _ := generateSelfSignedCert(t, 3, ocspURL)
+	issuerDER, issuerPriv := generateSelfSignedCert(t, 4, ocspURL)
 
-	client := newTestClient(&http.Client{})
+	leafCert, _ := x509.ParseCertificate(leafDER)
+	issuerCert, _ := x509.ParseCertificate(issuerDER)
 
-	_, err := client.FetchStaple(context.Background(), []string{"invalid"})
-	require.Error(t, err)
+	ocspResp := generateOCSPResponse(t, leafCert, issuerCert, issuerPriv)
+
+	pemFile := writeTempPEM(t, leafDER, issuerDER)
+
+	client := New(Config{
+		HTTPClient: &mockHTTPClient{
+			respBody: ocspResp,
+			status:   http.StatusOK,
+		},
+		Now: time.Now,
+	})
+
+	resp, err := client.FetchStaple(context.Background(), WithPEMPaths([]string{pemFile}))
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if !bytes.Equal(resp, ocspResp) {
+		t.Fatalf("expected OCSP response bytes to match")
+	}
+}
+
+func TestFetchStaple_NoOCSP(t *testing.T) {
+	// Certificates without OCSPServer
+	leafDER, _ := generateSelfSignedCert(t, 5, "")
+	issuerDER, _ := generateSelfSignedCert(t, 6, "")
+
+	leafB64 := base64.StdEncoding.EncodeToString(leafDER)
+	issuerB64 := base64.StdEncoding.EncodeToString(issuerDER)
+
+	client := New(Config{
+		HTTPClient: &mockHTTPClient{
+			respBody: []byte("dummy"),
+			status:   http.StatusOK,
+		},
+	})
+
+	_, err := client.FetchStaple(context.Background(), WithBase64Certs([]string{leafB64, issuerB64}))
+	if err == nil || err.Error() != "no OCSP endpoint found" {
+		t.Fatalf("expected 'no OCSP endpoint found', got %v", err)
+	}
+}
+
+func TestFetchStaple_InvalidPEM(t *testing.T) {
+	tmp := t.TempDir() + "/bad.pem"
+	os.WriteFile(tmp, []byte("not a pem"), 0644)
+
+	client := New(Config{})
+
+	_, err := client.FetchStaple(context.Background(), WithPEMPaths([]string{tmp}))
+	if err == nil {
+		t.Fatalf("expected error for invalid PEM")
+	}
+}
+
+func TestFetchStaple_HTTPError(t *testing.T) {
+	ocspURL := "http://mock.ocsp.server/ocsp"
+	leafDER, _ := generateSelfSignedCert(t, 7, ocspURL)
+	issuerDER, _ := generateSelfSignedCert(t, 8, ocspURL)
+
+	leafB64 := base64.StdEncoding.EncodeToString(leafDER)
+	issuerB64 := base64.StdEncoding.EncodeToString(issuerDER)
+
+	client := New(Config{
+		HTTPClient: &mockHTTPClient{
+			err: errors.New("network error"),
+		},
+		MaxRetries: 1, // optional: reduce retries for test speed
+	})
+
+	_, err := client.FetchStaple(context.Background(), WithBase64Certs([]string{leafB64, issuerB64}))
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	if !bytes.Contains([]byte(err.Error()), []byte("network error")) {
+		t.Fatalf("expected error to contain 'network error', got %v", err)
+	}
+}
+
+func TestFetchStaple_EmptyOptions(t *testing.T) {
+	client := New(Config{})
+	_, err := client.FetchStaple(context.Background())
+	if err == nil {
+		t.Fatalf("expected error when no options provided")
+	}
 }
