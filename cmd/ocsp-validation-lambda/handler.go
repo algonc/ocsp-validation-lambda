@@ -9,7 +9,7 @@ import (
 	"log"
 
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/algonc/ocsp-validation-lambda/pkg/ocspclient"
+	"github.com/algonc/ocspclient"
 )
 
 type Request struct {

@@ -1,4 +1,4 @@
-module github.com/algonc/ocsp-validation-lambda
+module github.com/algonc/ocspclient
 
 go 1.25.3
 
