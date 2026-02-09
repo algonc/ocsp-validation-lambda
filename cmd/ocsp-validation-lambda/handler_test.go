@@ -8,61 +8,78 @@ import (
 	"encoding/base64"
 	"errors"
 	"testing"
+
+	"github.com/algonc/ocspclient"
 )
 
-type mockClient struct {
+// -------------------- Mock OCSPFetcher --------------------
+
+type mockFetcher struct {
 	resp []byte
 	err  error
 }
 
-func (m *mockClient) FetchStaple(ctx context.Context, chain []string) ([]byte, error) {
+func (m *mockFetcher) FetchStaple(ctx context.Context, opts ...ocspclient.FetchOption) ([]byte, error) {
 	return m.resp, m.err
 }
 
-func TestHandler_Success(t *testing.T) {
-	originalClient := client
-	defer func() { client = originalClient }()
+// -------------------- Tests --------------------
 
-	expectedBytes := []byte("ocsp-response")
-	client = &mockClient{
-		resp: expectedBytes,
-		err:  nil,
-	}
+func TestHandler_Success(t *testing.T) {
+	// fake OCSP response
+	mockResp := []byte("fake-ocsp-response")
+
+	// inject mock
+	client = &mockFetcher{resp: mockResp, err: nil}
 
 	req := Request{
-		CertChain: []string{"leaf", "issuer"},
+		Base64CertChain: []string{
+			base64.StdEncoding.EncodeToString([]byte("leaf-cert")),
+			base64.StdEncoding.EncodeToString([]byte("issuer-cert")),
+		},
 	}
 
 	resp, err := handler(context.Background(), req)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	expectedB64 := base64.StdEncoding.EncodeToString(expectedBytes)
-
-	if resp.OCSPResponseBase64 != expectedB64 {
-		t.Fatalf("expected %s, got %s", expectedB64, resp.OCSPResponseBase64)
+	expected := base64.StdEncoding.EncodeToString(mockResp)
+	if resp.OCSPResponseBase64 != expected {
+		t.Fatalf("expected %s, got %s", expected, resp.OCSPResponseBase64)
 	}
 }
 
-func TestHandler_Error(t *testing.T) {
-	originalClient := client
-	defer func() { client = originalClient }()
+func TestHandler_ErrorNotEnoughCerts(t *testing.T) {
+	client = &mockFetcher{} // won't be called
 
-	client = &mockClient{
-		err: errors.New("fetch failed"),
+	req := Request{
+		Base64CertChain: []string{
+			base64.StdEncoding.EncodeToString([]byte("only-leaf")),
+		},
+	}
+
+	_, err := handler(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error for chain with less than 2 certs")
+	}
+}
+
+func TestHandler_ErrorFromFetcher(t *testing.T) {
+	client = &mockFetcher{
+		resp: nil,
+		err:  errors.New("OCSP fetch failed"),
 	}
 
 	req := Request{
-		CertChain: []string{"leaf", "issuer"},
+		Base64CertChain: []string{
+			base64.StdEncoding.EncodeToString([]byte("leaf")),
+			base64.StdEncoding.EncodeToString([]byte("issuer")),
+		},
 	}
 
-	resp, err := handler(context.Background(), req)
+	_, err := handler(context.Background(), req)
 	if err == nil {
-		t.Fatalf("expected error")
-	}
-
-	if resp.OCSPResponseBase64 != "" {
-		t.Fatalf("expected empty response")
+		t.Fatal("expected error from mock fetcher")
 	}
 }
